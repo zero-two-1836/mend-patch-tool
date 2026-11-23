@@ -49,6 +49,9 @@ function isSafe(p: string): boolean {
 /** The tree as the edits leave it: `now` holds the paths an edit has touched (null: deleted). */
 class Tree {
   private readonly orig = new Map<string, string | null>();
+  /** Paths that exist on disk but are not files: a directory is not a file
+   *  (changes to it are `missing`), yet a creation there is `exists`. */
+  private readonly dirs = new Set<string>();
   readonly now = new Map<string, string | null>();
   /** Successful moves, in the order the edits made them: [old path, new path]. */
   readonly moves: [string, string][] = [];
@@ -57,12 +60,18 @@ class Tree {
       let v: string | null = null;
       try {
         if (statSync(p).isFile()) v = readFileSync(p, 'utf8');
+        else this.dirs.add(p);
       } catch {
         v = null;
       }
       this.orig.set(p, v);
     }
     return this.orig.get(p)!;
+  }
+  /** Whether the path is a directory on disk, as the patch found it. */
+  isDir(p: string): boolean {
+    this.original(p);
+    return this.dirs.has(p);
   }
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
@@ -262,9 +271,13 @@ function parseUnified(lines: string[]): Edit[] {
       continue;
     }
     if (line.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) {
+      const pairOld = headerPath(line);
+      const pairNew = headerPath(lines[i + 1]!);
+      // A pair that names no file on either side names no edit at all.
+      if (pairOld === null && pairNew === null) throw new Exit2(`error: parse ${i + 1}`);
       if (sec === null || sec.hunks.length > 0 || sec.sawPair) sec = fresh();
-      sec.oldPath = headerPath(line);
-      sec.newPath = headerPath(lines[i + 1]!);
+      sec.oldPath = pairOld;
+      sec.newPath = pairNew;
       sec.sawPair = true;
       i += 2;
       continue;
@@ -278,12 +291,14 @@ function parseUnified(lines: string[]): Edit[] {
         continue;
       }
       if (line.startsWith('rename from ')) {
-        sec.oldPath = line.slice('rename from '.length).trim();
+        // The ---/+++ pair names the paths when there is one; rename lines
+        // only name them when no pair does, whatever order they come in.
+        if (!sec.sawPair) sec.oldPath = line.slice('rename from '.length).trim();
         i += 1;
         continue;
       }
       if (line.startsWith('rename to ')) {
-        sec.newPath = line.slice('rename to '.length).trim();
+        if (!sec.sawPair) sec.newPath = line.slice('rename to '.length).trim();
         i += 1;
         continue;
       }
@@ -300,6 +315,25 @@ function parseUnified(lines: string[]): Edit[] {
     }
     if (line.startsWith('@@')) {
       if (sec === null) throw new Exit2(`error: parse ${i + 1}`);
+      // A deletion's hunks are not read (section 6): skip the header and the
+      // body-shaped lines after it without interpreting any of them, so even a
+      // malformed `@@` line there cannot fail the parse.
+      const isCreateSec = (sec.oldPath === null || sec.newFile) && typeof (sec.newPath ?? sec.oldPath) === 'string';
+      if (!isCreateSec && (sec.newPath === null || sec.delFile)) {
+        let j = i + 1;
+        while (j < lines.length) {
+          const l = lines[j]!;
+          if (l.startsWith('diff --git ')) break;
+          if (l.startsWith('--- ') && (lines[j + 1] ?? '').startsWith('+++ ')) break;
+          if (l === '' || l[0] === ' ' || l[0] === '-' || l[0] === '+' || l[0] === '\\') {
+            j += 1;
+            continue;
+          }
+          break;
+        }
+        i = j;
+        continue;
+      }
       const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
       if (m === null) throw new Exit2(`error: parse ${i + 1}`);
       const body: (BodyLine & { emptyRaw: boolean })[] = [];
@@ -335,7 +369,7 @@ function unifiedEdit(sec: Section): Edit {
     if (isCreate) {
       const p = newP!;
       if (!isSafe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      if (tree.get(p) !== null || tree.isDir(p)) throw new Fail('exists', p);
       const flat: BodyLine[] = sec.hunks.flatMap((h) => h.body);
       const texts = flat.filter((e) => e.k === 'a').map((e) => e.s);
       tree.now.set(p, createdText(texts, !backslashAfterLast(flat)));
@@ -355,7 +389,7 @@ function unifiedEdit(sec: Section): Edit {
     const before = tree.get(from);
     if (before === null) throw new Fail('missing', from);
     const moving = from !== to;
-    if (moving && tree.get(to) !== null) throw new Fail('exists', to);
+    if (moving && (tree.get(to) !== null || tree.isDir(to))) throw new Fail('exists', to);
     const f = splitFile(before);
     let d = 0;
     for (const hunk of sec.hunks) {
@@ -447,7 +481,7 @@ function searchReplaceEdit(b: Block): Edit {
     const p = b.path;
     if (!isSafe(p)) throw new Fail('unsafe', p);
     if (b.oldLines.length === 0) {
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      if (tree.get(p) !== null || tree.isDir(p)) throw new Fail('exists', p);
       tree.now.set(p, createdText(b.newLines, true));
       return;
     }
@@ -473,13 +507,15 @@ interface Chunk {
   anchor: string | null;
   body: BodyLine[];
   eof: boolean;
+  /** True when the chunk was opened by a body line rather than an `@@` line. */
+  implicit?: boolean;
 }
 
 interface VSection {
   kind: 'add' | 'del' | 'upd';
   path: string;
   lineNo: number;
-  addLines: { s: string; blankRaw: boolean }[];
+  addLines: { s: string; blankRaw: boolean; wsLine?: number }[];
   moveTo: string | undefined;
   chunks: Chunk[];
 }
@@ -516,7 +552,10 @@ function parseV4a(lines: string[]): Edit[] {
     if (sec.kind === 'add') {
       if (line === '') sec.addLines.push({ s: '', blankRaw: true });
       else if (line.startsWith('+')) sec.addLines.push({ s: line.slice(1), blankRaw: false });
-      else if (isBlank(line)) sec.addLines.push({ s: line, blankRaw: true });
+      // A line of only whitespace is neither a `+` line nor an empty one. It is
+      // collected as a blank for now: at the end of the section it is dropped
+      // like any blank there; anywhere else it is a parse error, named below.
+      else if (isBlank(line)) sec.addLines.push({ s: line, blankRaw: true, wsLine: i + 1 });
       else throw new Exit2(`error: parse ${i + 1}`);
       i += 1;
       continue;
@@ -545,7 +584,7 @@ function parseV4a(lines: string[]): Edit[] {
     if (line === '' || line[0] === ' ' || line[0] === '-' || line[0] === '+') {
       if (!inChunk) {
         if (sec.chunks.length > 0) throw new Exit2(`error: parse ${i + 1}`);
-        sec.chunks.push({ anchor: null, body: [], eof: false });
+        sec.chunks.push({ anchor: null, body: [], eof: false, implicit: true });
         inChunk = true;
       }
       const chunk = sec.chunks[sec.chunks.length - 1]!;
@@ -570,11 +609,16 @@ function parseV4a(lines: string[]): Edit[] {
     // Blank lines at the end of a section are not part of it.
     if (s.kind === 'add') {
       while (s.addLines.length > 0 && s.addLines[s.addLines.length - 1]!.blankRaw) s.addLines.pop();
+      const stray = s.addLines.find((l) => l.wsLine !== undefined);
+      if (stray !== undefined) throw new Exit2(`error: parse ${stray.wsLine}`);
     }
     if (s.kind === 'upd') {
       const lastChunk = s.chunks[s.chunks.length - 1];
       if (lastChunk !== undefined) {
         while (lastChunk.body.length > 0 && lastChunk.body[lastChunk.body.length - 1]!.blankRaw === true) lastChunk.body.pop();
+        // A chunk opened by a body line whose lines were all end-of-section
+        // blanks held no body line at all: the section has no chunk.
+        if (lastChunk.implicit === true && lastChunk.anchor === null && !lastChunk.eof && lastChunk.body.length === 0) s.chunks.pop();
       }
       if (s.chunks.length === 0 && s.moveTo === undefined) throw new Exit2(`error: parse ${s.lineNo}`);
     }
@@ -587,7 +631,7 @@ function v4aEdit(sec: VSection): Edit {
     const p = sec.path;
     if (!isSafe(p)) throw new Fail('unsafe', p);
     if (sec.kind === 'add') {
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      if (tree.get(p) !== null || tree.isDir(p)) throw new Fail('exists', p);
       tree.now.set(p, createdText(sec.addLines.map((l) => l.s), true));
       return;
     }
@@ -600,7 +644,7 @@ function v4aEdit(sec: VSection): Edit {
     if (to !== undefined && !isSafe(to)) throw new Fail('unsafe', to);
     const before = tree.get(p);
     if (before === null) throw new Fail('missing', p);
-    if (to !== undefined && tree.get(to) !== null) throw new Fail('exists', to);
+    if (to !== undefined && (tree.get(to) !== null || tree.isDir(to))) throw new Fail('exists', to);
     const f = splitFile(before);
     let cursor = 0;
     for (const chunk of sec.chunks) {
@@ -666,7 +710,7 @@ function jsonEdit(v: unknown): Edit | null {
     const text = o.file_text;
     return (tree) => {
       if (!isSafe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      if (tree.get(p) !== null || tree.isDir(p)) throw new Fail('exists', p);
       tree.now.set(p, text);
     };
   }
